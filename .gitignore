@@ -1,0 +1,25 @@
+
+*.launch
+.cache
+#.settings
+*.metadata
+*.elf
+*.map
+*.o
+*.d
+*.su
+Debug
+
+**Backup
+bin
+obj
+**.zip
+
+
+# Doxygen generated files
+*latex
+*html
+*Debug
+
+compile_commands.json
+

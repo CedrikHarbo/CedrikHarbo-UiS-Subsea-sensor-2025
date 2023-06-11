@@ -1,0 +1,394 @@
+/**
+ * @file ICM20948.c
+ *
+ * @author Håvard Syslak
+ * @date 07.01.2023
+ *
+ * @breif Low level SPI drivers for the ICM20948 IMU
+ */
+
+#include "ICM20948.h"
+#include "stm32g4xx.h"
+#include "stm32g4xx_hal.h"
+#include "stm32g4xx_hal_spi.h"
+#include "stm32g4xx_hal_gpio.h"
+#include "stm32g4xx_hal_spi.h"
+#include "helpers.h"
+#include <stdint.h>
+
+
+/* 
+ * note: SPI operation features
+ * 1.   Data is delivered MSB first and LSB last
+ * 2.   Data is latched on the rising edge of SCLK
+ * 3.   Data should be transitioned on the falling edge of SCLK
+ * 4.   The maximum frequency of SCLK is 7Mhz
+ * 5.   SPI read and write operations are completed in 16 or more clock cycles (two or more bytes).
+ *      The first byte contains the SPI adress. The second byte(s) contains the Data
+ * 6.   MSB of adress = 1 ==> read operationicm
+ *      MSB of adress = 0 ==> write operation
+ */ 
+
+
+/**
+ * @brief Inisialiser ICM20948 IMU-en
+ */
+
+ICM20948_StatusTypeDef ICM20948_Init(ICM20948 *imu,
+        SPI_HandleTypeDef *hspi, 
+        uint16_t CS_Pin, 
+        GPIO_TypeDef *CS_GPIOx,
+        ICM20948_InitTypeDef *config)
+{
+    ICM20948_StatusTypeDef retval = ICM20948_OK;
+    imu->hspi = hspi;
+    imu->CS_Pin = CS_Pin;
+    imu->CS_GPIO = CS_GPIOx;
+
+    ICM20948_Set_Scale_Factor(imu, config->gyro_scale, config->accel_scale);
+
+    // Set CS pin low to enable spi communication
+    imu->CS_Pin_Status = DISABLED;
+    uint8_t tx_buf[2];
+    uint8_t rx_buf[2];
+
+    retval = ICM20948_Select_Register_Bank(imu, ICM20948_SEL_BANK_0);
+    if (retval != ICM20948_OK) return retval;
+    delay_ms(200);
+
+    // Sowftware reset ref p.19 in datasheet
+    ICM20948_Write_Register(imu, ICM20948_PWR_MGMT_1, tx_buf, rx_buf, ICM20948_RESET);
+    delay_ms(100);
+
+    // Starts in slepmode. Wakeup and select clk src.
+    // Wakeup and select clock.
+    retval = ICM20948_Write_Register(imu, ICM20948_PWR_MGMT_1, tx_buf, rx_buf, ICM20948_WAKEUP | config->clk_src);
+    delay_ms(80);
+    //while (HAL_GetTick() - tickstart <= 80) { }
+
+    // Check who am I?
+    retval = ICM20948_Read_Register(imu, ICM20948_WHO_AM_I, tx_buf, rx_buf);
+    if (retval != HAL_OK) return retval;
+    if (rx_buf[1] != 0xEAU) return ICM20948_INIT_ERROR; // TODO
+
+    uint8_t data = 0x10; // Disable i2c (SPI mode only)
+    retval = ICM20948_Write_Register(imu, ICM20948_USER_CTRL, tx_buf, rx_buf, data);
+    if (retval != HAL_OK) return retval;
+
+    data = 0x00; // Accel and gyro enabled
+    if (!config->accel_enable) 
+    {
+        data = 0x07 << 3;
+    }
+    if (!config->gyro_enable)
+    {
+        data |= 0x07;
+    }
+
+    retval = ICM20948_Write_Register(imu, ICM20948_PWR_MGMT_2, tx_buf, rx_buf, data);
+    if (retval != ICM20948_OK) return retval;
+
+    retval = ICM20948_Select_Register_Bank(imu, ICM20948_SEL_BANK_2);
+    if (retval != ICM20948_OK) return retval;
+
+    // enable ord align
+    data = 0x01;
+    retval = ICM20948_Write_Register(imu, ICM20948_ODR_ALIGN_ENABLE, tx_buf, rx_buf, data);
+    if (retval != HAL_OK) return retval;
+
+
+    retval = ICM20948_Init_Accel(imu, config);
+    if (retval != ICM20948_OK) return retval;
+
+    //data = 0x01;
+    //retval = ICM20948_Write_Register(imu, ICM20948_ACCEL_CONFIG, tx_buf, rx_buf, data);
+    //if (retval != HAL_OK) return retval;
+
+    // Gyro range pm 250 dps and enable gyro DLPF
+    // gyro Fb = 1125 / (1 + GYRO_SMPLRT_DIV)
+    // data = 0x00;
+    // retval = ICM20948_Write_Register(imu, ICM20948_GYRO_CONFIG_1, tx_buf, rx_buf, data);
+    // if (retval != HAL_OK) return retval;
+
+    //retval = ICM20948_Init_Gyro(imu, config);
+    if (retval != HAL_OK) return retval;
+
+
+    retval = ICM20948_Select_Register_Bank(imu, ICM20948_SEL_BANK_0);
+    if (retval != HAL_OK) return retval;
+
+    return retval;
+}
+
+/**
+ * @brief   Set skaleringsfaktor bassert på valgt måleområde.
+ *
+ */
+void ICM20948_Set_Scale_Factor(ICM20948 *imu, ICM20948_Gyro_Scale gyro_scale, ICM20948_Accel_Scale accel_scale)
+{
+    switch (gyro_scale) {
+        case ICM20948_250dps: 
+            imu->gyro_scale_factor = 131;
+            break;
+
+        case ICM20948_500dps:
+            imu->gyro_scale_factor = 65.5;
+            break;
+
+        case ICM20948_10000dps:
+            imu->gyro_scale_factor = 32.8;
+            break;
+
+        case ICM20948_2000dps:
+            imu->gyro_scale_factor = 16.4;
+            break;
+    } 
+
+    switch (accel_scale) {
+        case ICM20948_2g: 
+            imu->accel_scale_factor = 16384;
+            break;
+
+        case ICM20948_4g:
+            imu->accel_scale_factor = 8192;
+            break;
+
+        case ICM20948_8g:
+            imu->accel_scale_factor = 4096;
+            break;
+
+        case ICM20948_16g:
+            imu->accel_scale_factor = 2048;
+    } 
+}
+
+/**
+ * @brief Initialiser akselerometeret ihht. config struct ICM20948_InitTypeDef.
+ * @retval IMU status
+ *
+ * @note Akselsrometerets samplingsrate register er urørt. Får då samplingsrate på 1125Hz.
+ */
+ICM20948_StatusTypeDef ICM20948_Init_Accel(ICM20948 *imu, ICM20948_InitTypeDef *config)
+{
+    uint8_t tx_buf[2] = {0};
+    uint8_t rx_buf[2] = {0};
+
+    if (imu->selected_user_bank != ICM20948_SEL_BANK_2)
+    {
+        return ICM20948_Select_Register_Bank(imu, ICM20948_SEL_BANK_2);
+    }
+
+    uint8_t dplf_cfg = 0;
+    if (config->accel_lpf_enable) {
+        if (config->accel_break_freq <= 5.7) dplf_cfg = 0x06U;
+        else if (config->accel_break_freq <= 11.5) dplf_cfg = 0x05U;
+        else if (config->accel_break_freq <= 23.9) dplf_cfg = 0x04U;
+        else if (config->accel_break_freq <= 50.4) dplf_cfg = 0x03U;
+        else if (config->accel_break_freq <= 111.4) dplf_cfg = 0x02U;
+        else if (config->accel_break_freq <= 196.6) dplf_cfg = 0x00U;
+        else if (config->accel_break_freq <= 246.0) dplf_cfg = 0x01U;
+        else dplf_cfg = 0x07U; // => break freq = 473Hz 
+                               // Which is max when dplf is enabled
+    }
+
+    uint8_t data = (dplf_cfg << 3) | (config->accel_scale << 1) | config->accel_lpf_enable;
+    return ICM20948_Write_Register(imu, ICM20948_ACCEL_CONFIG, rx_buf, tx_buf, data);
+
+}
+
+/**
+ * @brief Initialiser akselerometeret ihht. config struct ICM20948_InitTypeDef.
+ * @retval IMU status
+ *
+ * @note Gyroskopets samplingsrate register er urørt. Får då samplingsrate på 1125Hz.
+ */
+ICM20948_StatusTypeDef ICM20948_Init_Gyro(ICM20948 *imu, ICM20948_InitTypeDef *config)
+{
+    if (imu->selected_user_bank != ICM20948_SEL_BANK_2)
+    {
+        ICM20948_Select_Register_Bank(imu, ICM20948_SEL_BANK_2);
+    }
+
+    uint8_t dplf_cfg = 0;
+    if (config->gyro_lpf_enable) {
+        if (config->gyro_break_freq <= 5.7) dplf_cfg = 0x06U;
+        else if (config->gyro_break_freq <= 11.6) dplf_cfg = 0x05U;
+        else if (config->gyro_break_freq <= 23.8) dplf_cfg = 0x04U;
+        else if (config->gyro_break_freq <= 51.2) dplf_cfg = 0x03U;
+        else if (config->gyro_break_freq <= 119.5) dplf_cfg = 0x02U;
+        else if (config->gyro_break_freq <= 151.8) dplf_cfg = 0x01U;
+        else if (config->gyro_break_freq <= 196.6) dplf_cfg = 0x00U;
+        else dplf_cfg = 0x07U; // => break freq = 351.4Hz
+                               // Which is max when dplf is enabled
+    }
+
+    uint8_t tx_buf[2] = {0};
+    uint8_t rx_buf[2] = {0};
+    uint8_t data = (dplf_cfg << 3) | (config->accel_scale << 1) | config->accel_lpf_enable;
+    ICM20948_StatusTypeDef retval = ICM20948_Write_Register(imu, ICM20948_ACCEL_CONFIG, rx_buf, tx_buf, data);
+
+    return retval;
+}
+/**
+ * @breif Enable SPI communication by setting CS pin low. 
+ * @param imu pointer to LCM20948 struct
+ *
+ * @note Does not acount for setuptime.. IMU should be initialized before calling this fuction
+ * 
+ * @retval None
+ */
+void ICM20948_SPI_Enable(ICM20948 *imu)
+{
+    HAL_GPIO_WritePin(imu->CS_GPIO, imu->CS_Pin, GPIO_PIN_RESET);
+    imu->CS_Pin_Status = ENABLED;
+    delay_ns(ICM20948_CS_SETUP_TIME_NS);
+}
+
+void ICM20948_SPI_Disable(ICM20948 *imu)
+{
+    delay_ns(ICM20948_CS_HOLD_TIME_NS);
+    HAL_GPIO_WritePin(imu->CS_GPIO, imu->CS_Pin, GPIO_PIN_SET);
+    imu->CS_Pin_Status = DISABLED;
+}
+
+
+ICM20948_StatusTypeDef ICM20948_Read_Register(ICM20948 *imu, uint8_t reg, uint8_t *pTx_buf, uint8_t *pRx_buf)
+{
+    //TODO check if chip is ENABLED
+    // If not enable and wait
+    ICM20948_StatusTypeDef retval = ICM20948_OK;
+    reg |= ICM20948_SPI_READ_MASK;
+    pTx_buf[0] = reg;
+    ICM20948_SPI_Enable(imu);
+    retval = (ICM20948_StatusTypeDef) HAL_SPI_TransmitReceive(imu->hspi, pTx_buf, pRx_buf, 2, ICM20948_SPI_TIMEOUT);
+    ICM20948_SPI_Disable(imu);
+    return retval;
+}
+
+
+ICM20948_StatusTypeDef ICM20948_Write_Register(ICM20948 *imu, uint8_t reg, uint8_t *pTx_buf, uint8_t *pRx_buf, uint8_t data)
+{
+    // TODO check if chip is ENABLED
+    // If not enable and wait
+    ICM20948_StatusTypeDef retval = ICM20948_OK;
+    reg &= ICM20948_SPI_WRITE_MASK;
+    pTx_buf[0] = reg;
+    pTx_buf[1] = data;
+
+    ICM20948_SPI_Enable(imu);
+    retval = (ICM20948_StatusTypeDef) HAL_SPI_TransmitReceive(imu->hspi, pTx_buf, pRx_buf, 2, ICM20948_SPI_TIMEOUT);
+    ICM20948_SPI_Disable(imu);
+    return retval;
+}
+
+/**
+ * @breif Change register bank
+ *
+ * @param imu ponter to ICM20948 struct 
+ * @param bank_nr register bank to choose (0, 1, 2, 3)
+ */
+
+ICM20948_StatusTypeDef ICM20948_Select_Register_Bank(ICM20948 *imu, uint8_t bank_nr)
+{
+    uint8_t tx_buf[2];
+    uint8_t rx_buf[2];
+    imu->selected_user_bank = bank_nr;
+    bank_nr = bank_nr << 4; // bit [3:0]: reserved, [5:4]: Selected bank
+
+    return ICM20948_Write_Register(imu, ICM20948_REG_BANK_SEL, tx_buf, rx_buf, bank_nr);
+}
+
+ICM20948_StatusTypeDef ICM20948_Accel_Offs_init(ICM20948 *imu)
+{
+    ICM20948_StatusTypeDef retval = ICM20948_OK;
+    retval = (ICM20948_StatusTypeDef) ICM20948_Select_Register_Bank(imu, ICM20948_SEL_BANK_1);
+    return retval;
+}
+
+ICM20948_StatusTypeDef ICM20948_Read_Accel(ICM20948 *imu)
+{
+    if (imu->selected_user_bank != ICM20948_SEL_BANK_0)
+    {
+        ICM20948_Select_Register_Bank(imu, ICM20948_SEL_BANK_0);
+        imu->selected_user_bank = ICM20948_SEL_BANK_0;
+    }
+
+    ICM20948_StatusTypeDef retval = ICM20948_OK;
+    uint8_t rx_buf[6];
+    uint8_t reg = ICM20948_ACCEL_XOUT_H | ICM20948_SPI_READ_MASK;
+
+    ICM20948_SPI_Enable(imu);
+    retval = (ICM20948_StatusTypeDef) HAL_SPI_Transmit(imu->hspi, &reg, 1, ICM20948_SPI_TIMEOUT);
+    retval = (ICM20948_StatusTypeDef) HAL_SPI_Receive(imu->hspi, rx_buf, 6, ICM20948_SPI_TIMEOUT);
+    ICM20948_SPI_Disable(imu);
+
+    imu->accel_data_raw[0] = rx_buf[0] << 8 | rx_buf[1];
+    imu->accel_data_raw[1] = rx_buf[2] << 8 | rx_buf[3];
+    imu->accel_data_raw[2] = rx_buf[4] << 8 | rx_buf[5];
+
+    imu->accel_data[0] = (float) imu->accel_data_raw[0] / imu->accel_scale_factor;
+    imu->accel_data[1] = (float) imu->accel_data_raw[1] / imu->accel_scale_factor;
+    imu->accel_data[2] = (float) imu->accel_data_raw[2] / imu->accel_scale_factor;
+    return retval;
+}
+
+ICM20948_StatusTypeDef ICM20948_Read_Gyro(ICM20948 *imu)
+{
+    if (imu->selected_user_bank != ICM20948_SEL_BANK_0)
+    {
+        ICM20948_Select_Register_Bank(imu, ICM20948_SEL_BANK_0);
+        imu->selected_user_bank = ICM20948_SEL_BANK_0;
+    }
+    uint8_t tx_buf[2] = {ICM20948_DATA_RDY_STATUS | ICM20948_SPI_READ_MASK, 0};
+    uint8_t rx_buf[6] = {0};
+
+    ICM20948_StatusTypeDef retval = ICM20948_OK;
+
+    uint8_t reg = ICM20948_GYRO_XOUT_H | ICM20948_SPI_READ_MASK;
+
+    ICM20948_SPI_Enable(imu);
+    HAL_SPI_Transmit(imu->hspi, &reg, 1, ICM20948_SPI_TIMEOUT);
+    retval = (ICM20948_StatusTypeDef) HAL_SPI_Receive(imu->hspi, rx_buf, 6, ICM20948_SPI_TIMEOUT);
+    ICM20948_SPI_Disable(imu);
+
+    imu->gyro_data_raw[0] = rx_buf[0] << 8 | rx_buf[1];
+    imu->gyro_data_raw[1] = rx_buf[2] << 8 | rx_buf[3];
+    imu->gyro_data_raw[2] = rx_buf[4] << 8 | rx_buf[5];
+
+    imu->gyro_data[0] = (float) imu->gyro_data_raw[0] / imu->gyro_scale_factor;
+    imu->gyro_data[1] = (float) imu->gyro_data_raw[1] / imu->gyro_scale_factor;
+    imu->gyro_data[2] = (float) imu->gyro_data_raw[2] / imu->gyro_scale_factor;
+
+    return retval;
+}
+
+
+/**
+ * @breif   Sjekk om ny data er klar.
+ *          Les data
+ *           
+ */
+ICM20948_StatusTypeDef ICM20948_Read_Data_Poll(ICM20948 *imu)
+{
+    ICM20948_StatusTypeDef retval = ICM20948_OK;
+    uint8_t tx_buf[2] = {0};
+    uint8_t rx_buf[2] = {0};
+    retval = ICM20948_Read_Register(imu, ICM20948_DATA_RDY_STATUS, tx_buf, rx_buf);
+    if (retval != ICM20948_OK) return retval;
+
+    if (rx_buf[1] & 0x01U)
+    {
+        retval = ICM20948_Read_Gyro(imu);
+        if (retval != ICM20948_OK) return retval;
+    }
+
+    if (rx_buf[1] & 0x03U)
+    {
+        retval = ICM20948_Read_Accel(imu);
+        if (retval != ICM20948_OK) return retval;
+    }
+
+    return retval;
+}
+
+
