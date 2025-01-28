@@ -10,6 +10,7 @@
 #include "stm32g4xx_hal_uart.h"
 #include "usart.h"
 uint8_t init_flags = 0;
+uint8_t globalData[8];
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs) 
 {
@@ -81,6 +82,7 @@ void FDCAN_Send(uint16_t id, FDCAN_HandleTypeDef *hfdcan, uint8_t *data)
 {
     TxHeader.Identifier = id; 
     HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &TxHeader, data);
+    memcpy(globalData, data, sizeof(globalData));
 }
 
 void FDCAN_Send_Accel_data(ICM20948 *imu, uint8_t ID)

@@ -70,6 +70,12 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+int i = 0;
+int a = 0;
+int b = 0;
+int c = 0;
+int d = 0;
+int e = 0;
 
 ICM20948 imu;
 STTS75 temp_sensor = {0};
@@ -162,13 +168,14 @@ int main(void)
     static last_leak_status = 0;
     while (1)
     {
+    	i += 1;
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
 
     	if (tim_flags.topside)
     	{
-            
+    		a += 1;
             tim_flags.topside = 0;
             if (temp_status || pres_status) Temp_error_handler(temp_status);
             FDCAN_Send_Temp_Pres(&temp_sensor, &pres_sensor, TOP_ID_TEMP_PRES);
@@ -184,6 +191,7 @@ int main(void)
 
         if (tim_flags.pres_read)
         {
+        	b += 1;
             tim_flags.pres_read = 0;
             pres_status = MS5837_Dybde(&pres_sensor);
             if (pres_status) Pres_error_handler(pres_status);
@@ -191,6 +199,7 @@ int main(void)
 
         if (tim_flags.temp_read)
         {
+        	c += 1;
     	    HAL_GPIO_TogglePin(GPIOB, LED1_Pin);
             tim_flags.temp_read = 0;
             temp_status = STTS75_Read_Temp(&temp_sensor);
@@ -198,6 +207,7 @@ int main(void)
         }
         if (tim_flags.reg_send) 
         {
+        	e += 1;
             tim_flags.reg_send = 0;
             imu_status = ICM20948_Read_Data_Poll(&imu);
             compute_orientation(&imu, &orient);
